@@ -14,13 +14,26 @@
 #  define USE_GLUT
 #endif
 
-
-
+/*#include <Eigen/Dense>
+using Eigen::Vector3d;
+using Eigen::Matrix3d;
+using Eigen::Vector2d;
+using Eigen::Matrix2d;
+using Eigen::Vector4d;
+using Eigen::Matrix4d;
+using Eigen::MatrixXd;
+using Eigen::Matrix;
+typedef Matrix<int, Dynamic, Dynamic> MatrixXi;*/
 ////////////////////////////////////////////////////////////////////////
 // Program variables
 ////////////////////////////////////////////////////////////////////////
+#include <iostream>
+#include <algorithm>
+#include <vector>
+#include "tinysplinecpp.h"
 
 // Filename program variables
+
 
 static char *input_scene_filename = NULL;
 static char *input_cameras_filename = NULL;
@@ -53,7 +66,7 @@ static double eye_height_radius = 0.05;
 
 // Camera sampling variables
 
-static double position_sampling = 0.25;
+static double position_sampling = 0.07;
 static double angle_sampling = RN_PI / 3.0;
 static double interpolation_step = 0.1;
 
@@ -64,7 +77,7 @@ static int scene_scoring_method = 0;
 static int object_scoring_method = 0;
 static double min_visible_objects = 3;
 static double min_visible_fraction = 0.01;
-static double min_distance_from_obstacle = 0;
+static double min_distance_from_obstacle = 0.05;
 static double min_score = 0;
 
 
@@ -1016,6 +1029,58 @@ FindIndexOfRandomPoint(const R2Grid& grid)
   return -1;
 }
 
+/*
+static int
+SmoothPathBetween(const R2Grid& grid, const Vector2d& init_pos,
+                  const Vector3d& init_direction,
+                  const Vector2d& end_pos,
+                  const Vector3d& end_direction,
+                  const ArrayXi& grid,
+                  int*path = nullptr,
+                  int* path_size = nullptr) {
+// Maybe we should take in a Tensor for the grid and a start, end 3D position?
+ArrayXi parents_x = ArrayXi::Zero(grid.rows(), grid.cols());
+ArrayXi parents_y = ArrayXi::Zero(grid.rows(), grid.cols());
+ArrayXd distances = ArrayXd::Zero(grid.rows(), grid.cols());
+parents_x -= 1; // Set the initial parent to -1 to know it's uninitialized.
+parents_y -= 1;
+double max_dist = 100000.0;
+distances += max_dist; // Set the initial distances to 'inf'
+distances(init_pos.x, init_pos.y) = 0.0;
+
+
+while (true) {
+  double cur_min = max_dist;
+  Vector2i cur_min_idx;
+  for (int i = 0; i < grid.rows(); ++i) {
+    for (int j = 0; j < grid.rows(); ++j) {
+        if (distances(i,j) < cur_min) {
+            cur_min = distances(i,j);
+            cur_min_idx = Vector2i(i,j);
+        }
+    }
+  }
+    
+  // Iterate over the neighbors:
+  for (int ni = -1; ni < 2; ++ni) {
+    for (int nj = -1; nj < 2; ++nj) {
+      Vector2i offset = Vector2i(ni,nj);
+      Vector2i neighbor = cur_min_idx + offset;
+      double cur_neighbor_dist = distances(neighbor.x, neighbor.y);
+      double alt_dist_to_neighbor = cur_min + offset.norm();
+      if (alt_dist_to_neighbor < cur_neighbor_dist) {
+        distances(neighbor.x, neighbor.y) = alt_dist_to_neighbor;
+        parents_x(neighbor.x, neighbor.y) = cur_min.x;
+        parents_y(neighbor.x, neighbor.y) = cur_min.y;
+      } 
+    }
+  }
+
+  
+}
+
+}*/
+
 
 
 static int
@@ -1049,6 +1114,18 @@ FindIndexOfFurthestPointAlongPath(const R2Grid& grid, int start_index,
         grid.IndicesToIndex(nx, ny, neighbor_index);
         if (neighbor_index == grid_index) continue;
         if (grid.GridValue(neighbor_index) != R2_GRID_UNKNOWN_VALUE) {
+          // Kgenova: Determine if this link is valid:
+          if (dx != 0 && dy != 0) {
+            
+            int vertical_idx;
+            grid.IndicesToIndex(ix, ny, vertical_idx);
+            int horizontal_idx;
+            grid.IndicesToIndex(nx, iy, horizontal_idx);
+            bool blocked_vertically = grid.GridValue(vertical_idx) == R2_GRID_UNKNOWN_VALUE;
+            bool blocked_horizontally = grid.GridValue(horizontal_idx) == R2_GRID_UNKNOWN_VALUE;
+            if (blocked_vertically || blocked_horizontally) { continue; }
+          }
+          
           RNScalar d = distance_grid.GridValue(grid_index) + sqrt(dx*dx + dy*dy);
           RNScalar old_d = distance_grid.GridValue(neighbor_index);
           if (d < old_d) {
@@ -1297,6 +1374,155 @@ CreateRoomCameras(void)
   }
 }
 
+R3Vector slerp(const R3Vector& v1, const R3Vector& v2, float t/*, float omega*/) {
+  /* Assumes the vectors are normalized. */
+  float cos_omega = v1.Dot(v2);
+  float omega = acos(cos_omega);
+  float sin_omega = sin(omega);
+  //float sin_omega = sqrt(1.0 - cos_omega*cos_omega);
+  float c1 = sin((1.0 - t) * omega) / sin_omega;
+  float c2 = sin(t * omega) / sin_omega;
+  return c1 * v1 + c2 * v2;
+}
+
+std::vector<R3Camera> ConvertTrajectoryToGAPSFormat(const std::vector<float>& trajectory,
+  float yfov, float neardist, float fardist) {
+  std::vector<R3Camera> output;
+  output.reserve(trajectory.size() / 6);
+  for (size_t i = 0; i < trajectory.size() / 6; ++i) {
+    R3Point position(trajectory[6*i], trajectory[6*i+1], trajectory[6*i+2]);
+    R3Vector towards(trajectory[6*i+3], trajectory[6*i+4], trajectory[6*i+5]);
+    
+    towards.Normalize();
+    R3Vector right = towards % R3posy_vector;
+    right.Normalize();
+    R3Vector up = right % towards;
+    up.Normalize();
+    R3Camera best_camera(position, towards, up, xfov, yfov, neardist, fardist);
+    output.push_back(best_camera); 
+  }
+  return output;
+}
+
+
+// InterpolateKeypoints creates a continuous trajectory of GAPS cameras from 
+// sparse target keypoints and a point of interest.
+// [keypoints] Is a vector containing a 2D [keypoint_count,3] array of the 3D camera keypoints to 
+//   interpolate, where keypoint_count is the number of keypoints in the sequence.
+//   (keypoints[3*i], keypoints[3*i+1], keypoints[3*i+2]) should contain the XYZ
+//   coordinates of the i-th keypoint in world space.
+// [lookat_point] contains the XYZ world space coordinate of the point of interest.
+// [lookat_weight] is the importance of the lookat_point in determining the
+//   final direction vector at each point in the trajectory. Formally, is the
+//   slerp coefficient from the the forward direction to the the vector from the
+//   current world position to lookat_point.
+// [downward_tilt] is a float in the range [0,1] dictating how much of a downward
+//   tilt to apply. It is the slerp coefficient from the tangent to the B-Spline to
+//   the world down direction at each step. The output is the 'forward' direction 
+//   before accounting for interest points.
+// [speed] is the speed of the camera in (world units)/second for the trajectory.
+//   This speed is not guaranteed because position along the curve is interpolated
+//   with a greedy first order taylor expansion algorithms. Accuracy will fall
+//   off as targeted speed increased. 
+// [fps] is the desired frames per second in the trajectory 'video' generated.
+// [start_time] The fractional point along the (length-normalized) curve defined
+//   by the keypoints at which to start the trajectory.
+// [end_time] The fractional point along the (length-normalized) curve defined
+//   by the keypoints at which to end the trajectory.
+// [verbose] Determines whether debug messages should be printed to stdout.
+//
+// Returns:
+// float = [curve_length] Is the length of the continuous trajectory in world space units.
+// [trajectory] The output trajectory. Has shape [frame_count,6]. Each tuple is [XYZ Nx Ny Nz].
+//   This output can be converted to the GAPS format with ConvertTrajectoryToR3CameraSequence().
+//
+// See CreatePathInRoomCameras() for an example of how to use this function.
+//
+// TODO:
+//   1. Add support for multiple interest points.
+//
+float InterpolateKeypoints(const std::vector<double>& keypoints, 
+    const float lookat_point[3], float lookat_weight, float downward_tilt,
+    float speed, float fps, std::vector<float>* trajectory) {
+  tinyspline::BSpline spline(keypoints.size()/3, 3, 3, TS_CLAMPED);
+  std::vector<double> ctrlp = spline.ctrlp();
+  std::copy(keypoints.begin(), keypoints.end(), ctrlp.begin()); 
+  spline.setCtrlp(ctrlp);
+ 
+  std::vector<double> result;
+
+  // Approximate the total curve length.
+  // We need a lot of samples because the curve is nonlinear in u.
+  int length_samples = 1000;
+  std::array<float,3> last_p = { 0.0, 0.0, 0.0 };
+  std::array<float,3> cur_p = last_p;
+  float curve_length = 0.0;
+  for (int i = 0; i < length_samples; ++i) {
+    float u = static_cast<float>(i) / (static_cast<float>(length_samples) - 1.0f);
+    result = spline.evaluate(u).result();
+    for (int j = 0; j < 3; ++j) {
+      cur_p[j] = static_cast<float>(result[j]);
+    }
+    if (i > 0) {
+      float segment_length_sq = 0.0;
+      for (int j = 0; j < 3; ++j) { 
+        segment_length_sq += (last_p[j] - cur_p[j])*(last_p[j] - cur_p[j]);
+      }
+      curve_length += sqrt(segment_length_sq);
+    }
+    last_p = cur_p;
+  }
+
+  tinyspline::BSpline beziers = spline.derive().toBeziers();
+  // Compute the number of steps to take from the curve length:
+  int total_frame_count  = static_cast<int>(fps * curve_length / speed);
+  // We want the samples to be evenly spaced in world space, but
+  // world position is not a linear function of u. So at each step,
+  // take a left-handed estimate of the derivative to compute the update
+  // to u for the next sample.
+  float u = 0.0f;
+  trajectory->reserve(6*total_frame_count);
+  for (int i = 0; i < total_frame_count; ++i) {
+    result = beziers.evaluate(u).result();
+    float derivative_at_u = sqrt(result[0]*result[0] +
+        result[1]*result[1] + result[2]*result[2]); // in meters / unit u
+    // We have a target a speed measured in meters / sec. 
+    // So speed / derivative is in  units u / sec;
+    // And seconds per frame * (speed / deriv) is in  units u / frame.
+    // (seconds/frame) = (1/fps). 
+    // So the final equation is: speed / (fps * derivative)
+    // This gives us a first order guess of the current sample point.
+    u += speed / (fps * derivative_at_u); 
+    // The curve isn't defined outside [0,1] but our approximation might
+    // bring us there:
+    if (u > 1.0f) { u = 1.0f; }
+    // Compute the camera at u
+    result = spline.evaluate(u).result();
+    R3Point viewpoint(result[0], result[1], result[2]);
+    // Compute tangent direction to the path at u.
+    // Technically we could cache this for the next loop,
+    // but it is unlikely to make a big difference.
+    result = beziers.evaluate(u).result();
+    R3Vector towards(result[0], result[1], result[2]);
+    towards.Normalize();
+    // Slerp downward according to the given coefficient
+    R3Vector down(0.0, -1.0, 0.0);
+    towards = slerp(towards, down, downward_tilt);
+    // We assume the lookat position is not too close to the path:
+    R3Point lookat_position(lookat_point[0], lookat_point[1], lookat_point[2]);
+    R3Vector lookat = lookat_position - viewpoint;
+    lookat.Normalize();
+    // The fraction should be 30 degrees:
+    towards.Normalize();
+    for (int vi = 0; vi < 3; ++vi) {
+      trajectory->push_back(viewpoint[vi]);
+    }
+    for (int ti = 0; ti < 3; ++ti) {
+      trajectory->push_back(towards[ti]);
+    }
+  }
+  return curve_length;
+}
 
 
 static void
@@ -1324,24 +1550,7 @@ CreatePathInRoomCameras(void)
     R2Grid viewpoint_mask;
     if (!ComputeViewpointMask(room_node, viewpoint_mask)) continue;
 
-    // Find largest connected component
-    R2Grid component_mask = viewpoint_mask;
-    component_mask.ConnectedComponentSizeFilter(RN_EPSILON);
-    RNScalar component_size = component_mask.Maximum();
-    component_mask.Threshold(component_size - 0.5, 0, 1.0);
-    component_mask.Substitute(0, R2_GRID_UNKNOWN_VALUE);
-    
-    // Find path between distant pair of points in largest connected component
-    int path_size = 0;
-    int random_point_index = FindIndexOfRandomPoint(component_mask);
-    if (random_point_index < 0) continue;
-    int start_point_index = FindIndexOfFurthestPointAlongPath(component_mask, random_point_index);
-    if (start_point_index < 0) continue;
-    int *path_indices = new int [ component_mask.NEntries() ];
-    int end_point_index = FindIndexOfFurthestPointAlongPath(component_mask, start_point_index, path_indices, &path_size);
-    if (end_point_index <= 0) { delete [] path_indices; continue; }
-
-    // Find the lookat point
+    // Find the lookat point. TODO(kgenova): Use raycasting for this to ignore occluded faces.
     RNScalar lookat_weight = 0;
     R3Point lookat_position = R3zero_point;
     for (int j = 0; j < room_node->NChildren(); j++) {
@@ -1352,38 +1561,123 @@ CreatePathInRoomCameras(void)
     }
     if (lookat_weight > 0) lookat_position /= lookat_weight;
     else lookat_position = room_node->Centroid();
+
+    // Mask out a circle of some radius around the lookat point to avoid paths that pass through it.
+    float la_z = lookat_position[2];
+    float la_x = lookat_position[0];
+    float grid_space_r = 15.0;
+    float grid_to_world = viewpoint_mask.GridToWorldScaleFactor();
+    float r_sq = (grid_to_world * grid_space_r) * (grid_to_world * grid_space_r);
+    int num_masked = 0;
+    for (int xi = 0; xi < viewpoint_mask.YResolution(); ++xi) {
+        for (int zi = 0; zi < viewpoint_mask.XResolution(); ++zi) {
+            // Map the points from grid coordinates to world coordinates.
+            R2Point world_zx = viewpoint_mask.WorldPosition(zi+0.5, xi+0.5);
+            float x_world = world_zx[1];
+            float z_world = world_zx[0];
+            float dist_sq = (x_world - la_x)*(x_world - la_x) + (z_world - la_z) * (z_world - la_z);
+            if (dist_sq < r_sq) {
+                viewpoint_mask(zi, xi) = R2_GRID_UNKNOWN_VALUE;
+                num_masked++;
+            }
+        }
+    }
+    //std::cout << "Masked a total of " << num_masked << " out of " << viewpoint_mask.NEntries() << " grid entries." << std::endl;
+    // Find largest connected component_mask
+    R2Grid component_mask = viewpoint_mask;
+    component_mask.ConnectedComponentSizeFilter(RN_EPSILON);
+    RNScalar component_size = component_mask.Maximum();
+    component_mask.Threshold(component_size - 0.5, 0, 1.0);
+    component_mask.Substitute(0, R2_GRID_UNKNOWN_VALUE);
+
+    // Find path between distant pair of points in largest connected component
+    int path_size = 0;
+    int random_point_index = FindIndexOfRandomPoint(component_mask);
+    if (random_point_index < 0) continue;
+    int start_point_index = FindIndexOfFurthestPointAlongPath(component_mask, random_point_index);
+    if (start_point_index < 0) continue;
+    int *path_indices = new int [ component_mask.NEntries() ];
+    int end_point_index = FindIndexOfFurthestPointAlongPath(component_mask, start_point_index, path_indices, &path_size);
+    if (end_point_index <= 0) { delete [] path_indices; continue; }
+
+    std::vector<int> useful_ids;
+    for (int i = 0; i < path_size; ++i) { 
+      if (i % 25 == 0) { 
+        useful_ids.push_back(path_indices[i]);
+      }
+    }
     
-    // Sample viewpoints on the path
-    int sample_ix, sample_iy;
-    int path_step = position_sampling * component_mask.WorldToGridScaleFactor();
-    if (path_step == 0) path_step = 1;
-    for (int i = 0; i < path_size; i += path_step) {
-      // Compute viewpoint
-      int sample_index = path_indices[i];
+    // Trim unnecessary nodes. No longer necessary since we subsample uniformly.
+    /*
+    useful_ids.push_back(path_indices[0]); // The first index is always necessary.
+    for (int i = 1; i < path_size-1; ++i) {
+      // Consider a sequence of path steps (prev, i, next).
+      // Step i is necessary if the relative motion vector (i - prev) is different
+      // from the motion vector (next - i).
+      int prev_x, prev_z, i_x, i_z, next_x, next_z;
+      component_mask.IndexToIndices(path_indices[i-1], prev_z, prev_x);
+      component_mask.IndexToIndices(path_indices[i], i_z, i_x);
+      component_mask.IndexToIndices(path_indices[i+1], next_z, next_x);
+      int pre_motion_z, pre_motion_x, post_motion_z, post_motion_x;
+      pre_motion_z = i_z - prev_z;
+      pre_motion_x = i_x - prev_x;
+      post_motion_z = next_z - i_z;
+      post_motion_x = next_x - i_x;
+      bool is_necessary = (pre_motion_z != post_motion_z) || (pre_motion_x != post_motion_x);
+      if (is_necessary) {
+        useful_ids.push_back(path_indices[i]);
+      }
+    }
+    useful_ids.push_back(path_indices[path_size-1]); // The last index is always necessary.
+    std::cout << "There are " << path_size << " total nodes and " << useful_ids.size() << " necessary nodes." << std::endl;*/
+       
+    // Get the keypoint world coordinates
+    std::vector<double> keypoints;
+    keypoints.reserve(3*useful_ids.size());
+    for (size_t i = 0; i < useful_ids.size(); ++i) {
+      int sample_ix, sample_iy;
+      int sample_index = useful_ids[i];
       component_mask.IndexToIndices(sample_index, sample_ix, sample_iy);
-      R2Point viewpoint_mask_position = component_mask.WorldPosition(sample_ix+0.5, sample_iy+0.5);  // ZX      
+      R2Point world_zx = component_mask.WorldPosition(sample_ix+0.5, sample_iy+0.5);
+      float x = world_zx[1];
+      float y = room_bbox.YMin() + eye_height; 
+      float z = world_zx[0];
 
-      // Compute height
-      RNScalar y = room_bbox.YMin() + eye_height;
-      y += 2.0*(RNRandomScalar()-0.5) * eye_height_radius;
-      if (y > room_bbox.YMax()) continue;
-
-      // Compute camera
-      R3Point viewpoint(viewpoint_mask_position[1], y, viewpoint_mask_position[0]);
-      if (R3Contains(viewpoint, lookat_position)) continue;
-      R3Vector towards = lookat_position - viewpoint;
-      towards.Normalize();
-      R3Vector right = towards % R3posy_vector;
-      right.Normalize();
-      R3Vector up = right % towards;
-      up.Normalize();
-      R3Camera best_camera(viewpoint, towards, up, xfov, yfov, neardist, fardist);
-
-      // Insert camera
-      if (print_debug) printf("PATH %s : %d / %d\n", room_node->Name(), i, path_size);
+      // Apply some random jitter to each point to better model a human path:
+      x += 2.0f*(RNRandomScalar()-0.5f) * eye_height_radius; // abuse of eye height radius
+      y += 2.0f*(RNRandomScalar()-0.5f) * eye_height_radius;
+      z += 2.0f*(RNRandomScalar()-0.5f) * eye_height_radius; // abuse of eye height radius
+      keypoints.push_back(x);
+      keypoints.push_back(y);
+      keypoints.push_back(z);
+    }
+     
+    float lookat_point[3];
+    for (int i = 0; i < 3; ++i) { lookat_point[i] = lookat_position[i]; }
+    float lookat_coef = 0.33f; // fractional
+    float downward_tilt = 0.18f; // fractional
+    float speed = 0.35f; // meters / second. 
+    float fps = 30.0f; // frames / second
+    std::vector<float> output_trajectory_buffer;
+    // The output curve length is in meters
+    float curve_length = InterpolateKeypoints(keypoints, lookat_point,
+                                              lookat_coef, downward_tilt,
+                                              speed, fps, 
+                                              &output_trajectory_buffer);
+    
+    std::vector<R3Camera> trajectory = ConvertTrajectoryToGAPSFormat(
+      output_trajectory_buffer, yfov, neardist, fardist);
+    std::cout<< "The curve has length " << curve_length << std::endl;
+    if (curve_length < 7.0f) { continue; } // Skip short trajectories...
+    
+    // Ignore the first and last 10% of the trajectory:
+    int cutoff_start = trajectory.size() / 10;
+    int cutoff_end = (9*trajectory.size()) / 10;
+ 
+    for (int i = cutoff_start; i < cutoff_end; ++i) {
       char name[1024];
       sprintf(name, "%s_%d", room_node->Name(), i);
-      Camera *camera = new Camera(best_camera, name);
+      Camera* camera = new Camera(trajectory[i], name);
       cameras.Insert(camera);
       camera_count++;
     }
@@ -1391,7 +1685,7 @@ CreatePathInRoomCameras(void)
     // Delete temporary memory
     delete [] path_indices;
   }
-        
+ 
   // Print statistics
   if (print_verbose) {
     printf("Created room cameras ...\n");
@@ -1400,7 +1694,6 @@ CreatePathInRoomCameras(void)
     fflush(stdout);
   }
 }
-
 
 
 static void
